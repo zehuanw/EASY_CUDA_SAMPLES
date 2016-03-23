@@ -8,9 +8,6 @@ import urllib2
 import StringIO
 import time
 import numpy as np
-import skimage
-from skimage.io import imread
-from skimage.transform import resize
 from Queue import Empty
 import gevent.monkey
 gevent.monkey.patch_socket()
@@ -22,14 +19,24 @@ from multiprocessing import Queue, Process, Pool
 from multiprocessing import Lock, Manager
 import affinity
 import ctypes
-import cv2
+
 
 CAFFE_ROOT = "/root/work/caffe-master-new/"
-DEPLOY_FILE = "/root/work/caffe-master-new/models/bvlc_alexnet/deploy.prototxt"#"/root/lu/112_Youtu/VGG_ILSVRC_16_layers_deploy.prototxt"
-MODEL_FILE = "/root/work/caffe-master-new/models/bvlc_alexnet/caffe_alexnet_train_iter_100.caffemodel"#"/root/lu/112_Youtu/VGG_ILSVRC_16_layers.caffemodel"#
-MEAN_FILE = "/root/work/caffe-master-new/python/caffe/imagenet/ilsvrc_2012_mean.npy"#"/root/lu/112_Youtu/meanfile.npy"#
+DEPLOY_FILE = "/root/lu/112_Youtu/VGG_ILSVRC_16_layers_deploy.prototxt"#"/root/work/caffe-master-new/models/bvlc_alexnet/deploy.prototxt"#
+MODEL_FILE = "/root/lu/112_Youtu/VGG_ILSVRC_16_layers.caffemodel"#"/root/work/caffe-master-new/models/bvlc_alexnet/caffe_alexnet_train_iter_100.caffemodel"#
+MEAN_FILE = "/root/lu/112_Youtu/meanfile.npy"#"/root/work/caffe-master-new/python/caffe/imagenet/ilsvrc_2012_mean.npy"#
 TEST_SET = "/root/lu/112_Youtu/data/VOCdevkit/VOC2007/JPEGImages/"
 URL_FILE = "/root/lu/112_Youtu/data/VOCdevkit/VOC2007/ImageSets/Layout/trainval.txt"
+DETAIL_TIME = False
+HAVE_PYTHON_OPENCV = False
+
+if HAVE_PYTHON_OPENCV == True:
+    import cv2
+else:
+    import skimage
+    from skimage.io import imread
+    from skimage.transform import resize
+
 
 sys.path.insert(0, CAFFE_ROOT + 'python')
 import caffe
@@ -79,12 +86,14 @@ class Downloader:
         url = self._url_iter.next()
         try:
             t1 = time.time()
-            #f = open(self._test_set + url.strip() + '.jpg')
-            #s = f.read()
+            if HAVE_PYTHON_OPENCV == False:
+                f = open(self._test_set + url.strip() + '.jpg')
+                s = f.read()
             t2 = time.time()
-            #g1 = skimage.io.imread(StringIO.StringIO(s))
-            g = cv2.imread(self._test_set + url.strip() + '.jpg')
-#            print (g - g1)
+            if HAVE_PYTHON_OPENCV == False:
+                g = skimage.io.imread(StringIO.StringIO(s))
+            else:
+                g = cv2.imread(self._test_set + url.strip() + '.jpg')
             t3 = time.time()
             img = np.float32(g)
             #img = skimage.img_as_float(g).astype(np.float32)#no need to int2float!?
@@ -95,7 +104,8 @@ class Downloader:
                 img = img[:, :, :3]
             t5 = time.time()
             t6 = time.time()
-            print "download",1000*(t2-t1),1000*(t3-t2),1000*(t4-t3),1000*(t5-t4),1000*(t6-t5)
+            if DETAIL_TIME == True:
+                print "download",1000*(t2-t1),1000*(t3-t2),1000*(t4-t3),1000*(t5-t4),1000*(t6-t5)
             return (img, url)
         except Exception, e:
             return e
@@ -114,7 +124,10 @@ class Preprocessor:
         transformer.set_transpose('data', (2,0,1))
         transformer.set_mean('data', np.load(mean_file).mean(1).mean(1))
         transformer.set_raw_scale('data', 255)
-        transformer.set_channel_swap('data', (0, 1, 2))
+        if HAVE_PYTHON_OPENCV == False:
+            transformer.set_channel_swap('data', (2, 1, 0))
+        else:
+            transformer.set_channel_swap('data', (0, 1, 2))
         self._transformer = transformer
         self._crop_dims = net.blobs['data'].data.shape[-2:]
 
@@ -125,8 +138,10 @@ class Preprocessor:
             if use_oversample == True:
                 img = np.zeros((len(img_batch),self._image_dims[0], self._image_dims[1], img_in.shape[2]), dtype=np.float32)
                 for ix, in_ in enumerate(img_batch):
-#                    img[ix] = caffe.io.resize_image(in_, self._image_dims)
-                    img[ix] = cv2.resize(in_,self._image_dims)
+                    if HAVE_PYTHON_OPENCV == False:
+                        img[ix] = caffe.io.resize_image(in_, self._image_dims)
+                    else:
+                        img[ix] = cv2.resize(in_,self._image_dims)
                 img2 = caffe.io.oversample(img, self._crop_dims) #image will be copied 10 times refer to io.py
                 img_out = np.zeros(np.array(img2.shape)[[0, 3, 1, 2]], dtype=np.float32) #some opt?
                 for ix, in_ in enumerate(img2):
@@ -137,15 +152,18 @@ class Preprocessor:
                 img = np.zeros((len(img_batch),self._crop_dims[0], self._crop_dims[1], img_in.shape[2]), dtype=np.float32)
                 t2 = time.time()
                 for ix, in_ in enumerate(img_batch):
-#                    img[ix] = caffe.io.resize_image(in_, self._crop_dims)
-                    img[ix] = cv2.resize(in_,self._crop_dims)
+                    if HAVE_PYTHON_OPENCV == False:
+                        img[ix] = caffe.io.resize_image(in_, self._crop_dims)
+                    else:
+                        img[ix] = cv2.resize(in_,self._crop_dims)
                 t3 = time.time()
                 img_out = np.zeros(np.array(img.shape)[[0, 3, 1, 2]], dtype=np.float32) #some opt?
                 t4 = time.time()
                 for ix, in_ in enumerate(img):
                     img_out[ix] = self._transformer.preprocess('data', in_)
                 t5 = time.time()
-                print "preprocess",1000*(t2-t1),1000*(t3-t2),1000*(t4-t3),1000*(t5-t4)
+                if DETAIL_TIME == True:
+                    print "preprocess",1000*(t2-t1),1000*(t3-t2),1000*(t4-t3),1000*(t5-t4)
                 return img_out
         except Exception, e:
             return e
@@ -171,10 +189,12 @@ def inference_process(event,gid=0):
         input_pair = dl.download_one()
         t2 = time.time()
         img = prep.preprocess(input_pair[0],use_oversample = False)
+        #img = prep.preprocess(input_pair[0],use_oversample = True)
         t3 = time.time()
-#        img = prep.preprocess(input_pair[0],use_oversample = True)
         pred = net.net_pred(img)
         t4 = time.time()
+        if DETAIL_TIME == True:
+            print("gpu# %d, class %d,  download %.6fms, preprocess %.6fms,net_pred %.6fms" % (gid,pred,(t2-t1)*1000,(t3-t2)*1000,(t4-t3)*1000))
         print("gpu# %d, class %d,  download %.6fms, preprocess %.6fms,net_pred %.6fms" % (gid,pred,(t2-t1)*1000,(t3-t2)*1000,(t4-t3)*1000))
     t5 = time.time()
     print("gpu# %d, average time %.6fms" % (gid, 1000*(t5-t0)/IMAGE_NUM))
@@ -197,12 +217,11 @@ def case1():
         input_pair = dl.download_one()
         t2 = time.time()
         img = prep.preprocess(input_pair[0],use_oversample = False)
-        #        img = prep.preprocess(input_pair[0],use_oversample = True)
+        #img = prep.preprocess(input_pair[0],use_oversample = True)
         t3 = time.time()
         pred = net.net_pred(img)
         t4 = time.time()
         print("class %d, download %.6fms, preprocess %.6fms,net_pred %.6fms" % (pred,(t2-t1)*1000,(t3-t2)*1000,(t4-t3)*1000))
- 
     del net
     del dl
     del prep
@@ -213,7 +232,7 @@ def case2():
     workers = [Process(target = inference_process, args=(event,i)) for i in range(WORKER_NUM)]
     for worker in workers:
         worker.start()
-    time.sleep(10)
+    time.sleep(30)
     event.set()
     for worker in workers:
         worker.join()
@@ -221,6 +240,6 @@ def case2():
         
         
 if __name__ == "__main__":
-    case1()
+    case2()
     print("ok.")
 

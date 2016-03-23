@@ -30,6 +30,10 @@ URL_FILE = "/root/lu/112_Youtu/data/VOCdevkit/VOC2007/ImageSets/Layout/trainval.
 DETAIL_TIME = False
 HAVE_PYTHON_OPENCV = False
 
+PREPROCESS_WORKER_NUM = 4
+PREDICT_WORKER_NUM = 4
+DOWNLOAD_WORKER_NUM = 4
+
 if HAVE_PYTHON_OPENCV == True:
     import cv2
 else:
@@ -111,16 +115,56 @@ class Downloader:
             return e
     def __del__(self):
         self._url_file.close()
+
+class Downloader_v2:
+    _test_set = []
+    _url_file = []
+    _url_iter = []
+    def get_url(self):
+        for url in self._url_file:
+            yield url
+    def __init__(self, url_file = URL_FILE):
+        self._url_file = open(url_file)
+        self._url_iter = self.get_url()
+    def __del__(self):
+        self._url_file.close()
+
+def download_one(url,test_set = TEST_SET):
+    try:
+        t1 = time.time()
+        if HAVE_PYTHON_OPENCV == False:
+            f = open(test_set + url.strip() + '.jpg')
+            s = f.read()
+        t2 = time.time()
+        if HAVE_PYTHON_OPENCV == False:
+            g = skimage.io.imread(StringIO.StringIO(s))
+        else:
+            g = cv2.imread(test_set + url.strip() + '.jpg')
+        t3 = time.time()
+        img = np.float32(g)
+        #img = skimage.img_as_float(g).astype(np.float32)#no need to int2float!?
+        t4 = time.time()
+        if img.ndim == 2:
+            img = np.tile(img[:, :, np.newaxis], (1, 1, 3))
+        elif img.shape[2] == 4:
+            img = img[:, :, :3]
+        t5 = time.time()
+        t6 = time.time()
+        if DETAIL_TIME == True:
+            print "download",1000*(t2-t1),1000*(t3-t2),1000*(t4-t3),1000*(t5-t4),1000*(t6-t5)
+        return (img, url)
+    except Exception, e:
+        return (None,url)
         
 
 class Preprocessor:
     _image_dims = []
     _crop_dims = []
     _transformer = []
-    def __init__(self,net,image_dims = (256, 256),mean_file = MEAN_FILE):
+    def __init__(self,net_interface,image_dims = (256, 256),mean_file = MEAN_FILE):
         self._mean_file = mean_file
         self._image_dims = image_dims
-        transformer = caffe.io.Transformer({'data': net.blobs['data'].data.shape})
+        transformer = caffe.io.Transformer({'data': net_interface})
         transformer.set_transpose('data', (2,0,1))
         transformer.set_mean('data', np.load(mean_file).mean(1).mean(1))
         transformer.set_raw_scale('data', 255)
@@ -129,7 +173,7 @@ class Preprocessor:
         else:
             transformer.set_channel_swap('data', (0, 1, 2))
         self._transformer = transformer
-        self._crop_dims = net.blobs['data'].data.shape[-2:]
+        self._crop_dims = net_interface[-2:]
 
     def preprocess(self, img_in, use_oversample = True):
         try:
@@ -176,7 +220,7 @@ def inference_process(event,gid=0):
 
     net = CaffePredictor(gid)
     dl = Downloader()
-    prep = Preprocessor(net._net)
+    prep = Preprocessor(net._net.blobs['data'].data.shape)
 
     #warming up
     input_pair = dl.download_one()
@@ -202,13 +246,45 @@ def inference_process(event,gid=0):
     del dl
     del prep
 
+def preprocess_process(event,fileQueue,imgQueue,net_interface):
+    pid = os.getpid()
+    mask = affinity.get_process_affinity_mask(pid)
+    affinity.set_process_affinity_mask(pid,(1 << pid%20))
+    prep = Preprocessor(net_interface)
+    event.wait()
+    while True:
+        try:
+            img_in, url = fileQueue.get(timeout=6)
+            img = prep.preprocess(img_in,use_oversample = False)
+            imgQueue.put((img,url),block=True)
+        except (TimeoutError, Empty):
+            print("finish preproc: %.6f" % (time.time()))
+            del prep
+            return None
         
+def predict_process(event,imgQueue,gid=0):
+    pid = os.getpid()
+    mask = affinity.get_process_affinity_mask(pid)
+    affinity.set_process_affinity_mask(pid,(1 << pid%20))
+    net = CaffePredictor(gid)
+    event.wait()
+    while True:
+        try:
+            img, url = imgQueue.get(timeout=6)
+            pred = net.net_pred(img)#batchsize
+            print("gpu# %d, url %s, class %d" % (gid,url.strip(),pred)) 
+        except (TimeoutError, Empty):
+            print("finish predict: %.6f" % (time.time()))
+            del net
+            return None
+    
+    
 def case1():
     net = CaffePredictor(0)
     dl = Downloader()
 
     #warming up
-    prep = Preprocessor(net._net)
+    prep = Preprocessor(net._net.blobs['data'].data.shape)
     input_pair = dl.download_one()
     img = prep.preprocess(input_pair[0],use_oversample = False)
     pred = net.net_pred(img)
@@ -224,8 +300,7 @@ def case1():
         print("class %d, download %.6fms, preprocess %.6fms,net_pred %.6fms" % (pred,(t2-t1)*1000,(t3-t2)*1000,(t4-t3)*1000))
     del net
     del dl
-    del prep
-
+    del pred
     
 def case2():
     event = multiprocessing.Event()
@@ -238,8 +313,29 @@ def case2():
         worker.join()
     time.sleep(10)
         
-        
+def case3():
+    event = multiprocessing.Event()
+    net_interface = (1,3,224,224)#net._net.blobs['data'].data.shape
+    fileQueue, imgQueue = Queue(maxsize=40), Queue(maxsize=40)
+    preprocess_workers = [Process(target = preprocess_process, args=(event,fileQueue,imgQueue,net_interface)) for i in range(PREPROCESS_WORKER_NUM)]
+    predict_workers = [Process(target = predict_process, args=(event,imgQueue,i)) for i in range(PREDICT_WORKER_NUM)]
+    dl = Downloader_v2()
+    for preprocess_worker in preprocess_workers:
+        preprocess_worker.start()
+    for predict_worker in predict_workers:
+        predict_worker.start()
+    time.sleep(30)
+    event.set()
+    p = Pool(DOWNLOAD_WORKER_NUM)
+    for f in p.imap_unordered(download_one, dl._url_iter):
+        fileQueue.put(f, block = True)
+    for preprocess_worker in preprocess_workers:
+        preprocess_worker.join()
+    for predict_worker in predict_workers:
+        predict_worker.join()
+
+
 if __name__ == "__main__":
-    case2()
+    case3()
     print("ok.")
 
